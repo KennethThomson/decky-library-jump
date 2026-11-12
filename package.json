@@ -1,0 +1,28 @@
+{
+  "name": "decky-library-jump",
+  "version": "0.1.19",
+  "description": "Decky plugin for Steam Deck: hold R2/L2 in your library to quickly step through your library, on any sort.",
+  "type": "module",
+  "scripts": {
+    "build": "shx rm -rf dist && rollup -c",
+    "watch": "rollup -c -w",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": { "type": "git", "url": "git+https://github.com/KennethThomson/decky-library-jump.git" },
+  "keywords": ["decky", "plugin", "steam-deck", "library", "navigation"],
+  "author": "KennethThomson",
+  "license": "MIT",
+  "homepage": "https://github.com/KennethThomson/decky-library-jump",
+  "devDependencies": {
+    "@decky/api": "^1.1.2",
+    "@decky/rollup": "^1.0.1",
+    "@decky/ui": "^4.11.0",
+    "@types/react": "16.14.0",
+    "@types/webpack": "^5.28.5",
+    "rollup": "^4.22.5",
+    "shx": "^0.3.4",
+    "tslib": "^2.6.1",
+    "typescript": "^4.9.5"
+  },
+  "dependencies": { "react-icons": "^4.12.0" }
+}

@@ -1,0 +1,12 @@
+{
+    "name": "Library Jump",
+    "author": "KennethThomson",
+    "license": "MIT",
+    "flags": [],
+    "api_version": 1,
+    "publish": {
+        "tags": ["Library", "Navigation", "Quality of Life"],
+        "description": "Better library navigation for the Steam Deck: hold a trigger (R2/L2) to quickly step through your library, or tap it at the end of the list to wrap to the other end.",
+        "image": "https://raw.githubusercontent.com/KennethThomson/decky-library-jump/main/assets/thumbnail.png"
+    }
+}
