@@ -1,9 +1,7 @@
 // @ts-nocheck
 // injector.ts serialises this function and evals it inside the Big Picture window, so it must stay ONE self-contained function.
-// Holding R2/L2 in the library grid steps through the sort's groups (letters on A-Z, sections on other sorts) and jumps once on release.
-// Steam's own R2/L2 step (its "AppGridFastScroll" hook) is not used: it animates every step, then clears the overlay label and moves
-// focus, which made the overlay blink while held. Instead we read the same data that hook uses (the grid's childSections and its
-// section/item refs), compute the groups ourselves, and drive Steam's overlay label, scroll and focus directly.
+// Read the same data Steam's AppGridFastScroll hook uses (the grid's childSections and its section/item refs),
+// compute the groups ourselves, and drive Steam's overlay label, scroll and focus directly.
 // Steam internals are found by shape, not minified name. window.libraryJump.undo() removes everything.
 export function injectLibraryJump(configFromInjector) {
     return (() => {
