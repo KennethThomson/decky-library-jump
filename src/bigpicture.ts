@@ -1,620 +1,440 @@
 // @ts-nocheck
 // injector.ts serialises this function and evals it inside the Big Picture window, so it must stay ONE self-contained function.
-// R2/L2 normally step one section per press; this repeats Steam's own step while held and jumps once on release.
-// Steam internals are found by shape, not minified name. If one isn't found we do nothing. window.libraryJump.undo() removes everything.
+// Holding R2/L2 in the library grid steps through the sort's groups (letters on A-Z, sections on other sorts) and jumps once on release.
+// Steam's own R2/L2 step (its "AppGridFastScroll" hook) is not used: it animates every step, then clears the overlay label and moves
+// focus, which made the overlay blink while held. Instead we read the same data that hook uses (the grid's childSections and its
+// section/item refs), compute the groups ourselves, and drive Steam's overlay label, scroll and focus directly.
+// Steam internals are found by shape, not minified name. window.libraryJump.undo() removes everything.
 export function injectLibraryJump(configFromInjector) {
     return (() => {
         if (window.libraryJump) window.libraryJump.undo();
 
         const config = {
             HOLD_DELAY_MS: 450, // hold this long before repeating starts
-            START_INTERVAL_MS: 250,
+            START_INTERVAL_MS: 250, // time between steps while held
             BTN_R2: 8, BTN_L2: 7, // button ids
-            LABEL_CHECK_MS: 60, // wait this long for Steam's label to change, to tell if a step was accepted
-            FAST_END_MS: 40, // end Steam's 350 ms scroll animation this long after each step (-1 = never)
-            RETRY_MS: 40,
-            GIVE_UP_MS: 700, // stop retrying after this long: end of list
-            OVERLAY_LINGER_MS: 500,
-            ANIM_MS: 180,
             WRAP_ON_TAP: true,
-            WRAP_MIN_GAP_MS: 300, // don't wrap right after a hold that just reached the end
+            WRAP_MIN_GAP_MS: 300, // a hold that stopped at the end doesn't wrap on a press this soon after its release
+            LABEL_LINGER_MS: 350, // keep the overlay letter this long after landing
+            LAND_TIMEOUT_MS: 1500, // keep re-scrolling/focusing this long while the virtualised grid mounts the target tile
+            SORT_ALPHABETICAL: 1, SORT_ACHIEVEMENTS: 2, SORT_FRIENDS_PLAYING: 10, // Steam's eSortBy values with one section
         };
         Object.assign(config, configFromInjector || {});
-
-        const getGridScroller = () => document.querySelector("._TabContentsScroll");
 
         const state = {
             heldButton: null,
             repeatTimer: null,
-            swallowScroll: false, // true during hold/wrap: scrolls are recorded, not performed
-            lastScrollTarget: null, // last scroll position Steam tried to set; where we jump on release
-            scrollFocusCalls: 0, // scroll/focus calls on the grid; a change during a step means Steam stepped
-            ignoreScrollIntoViewUntil: 0,
-            hasStepped: false,
-            steamHandledPress: false, // Steam consumed the last press (a step, or a refusal at a boundary)
-            animatorWasActive: false, // Steam's animation was running before the last step
-            lastReleaseAt: 0,
-            releaseTimer: null,
-            settleId: 0,
+            press: null, // { grid, groups, groupIndex, wrapped } for the press in progress
+            landingId: 0,
+            labelClearTimer: null,
+            lastRelease: { at: 0, holdStoppedAtEnd: false },
+            warnedGridNotFound: false,
+            focusedTileByTab: new Map(), // tab name -> { sectionIndex, itemIndex, appid, sortBy } of the last focused tile
+            knownScrollers: new WeakSet(), // grid scrollers already seen; a new one means the grid was remounted
         };
 
-        const findSteamGridHook = (matchComponent) => {
+        const getGridScroller = () => document.querySelector("._TabContentsScroll");
+
+        // The library grid component (props childSections, eSortBy, elScrollElement) sits below the scroller. Its first hooks come
+        // from Steam's fast-scroll hook: section ref, item ref, Map "section_item" -> tile nav ref (mounted tiles only), the overlay
+        // label state, and the overlay's nav ref (a focusable placeholder that holds focus while the grid scrolls).
+        const readSteamGrid = () => {
             const scrollerElement = getGridScroller();
             if (!scrollerElement) return null;
-            const fiberKey = Object.keys(scrollerElement).find((key) =>
-                key.startsWith("__reactFiber$"),
-            );
-            let gridFiber = scrollerElement[fiberKey];
-            for (let depth = 0; gridFiber && depth < 80; depth++, gridFiber = gridFiber.return)
-                if (
-                    gridFiber.memoizedProps &&
-                    "eSortBy" in gridFiber.memoizedProps &&
-                    "elScrollElement" in gridFiber.memoizedProps
-                )
-                    break;
-            if (!gridFiber) return null;
-            const pending = [gridFiber];
-            let visited = 0;
-            while (pending.length && visited++ < 30000) {
+            const fiberKey = Object.keys(scrollerElement).find((key) => key.startsWith("__reactFiber$"));
+            const rootFiber = fiberKey && scrollerElement[fiberKey];
+            const pending = rootFiber ? [rootFiber] : [];
+            let gridFiber = null;
+            for (let visited = 0; pending.length && visited < 30000; visited++) {
                 const fiber = pending.pop();
-                if (fiber.sibling && fiber !== gridFiber) pending.push(fiber.sibling);
+                if (fiber.sibling && fiber !== rootFiber) pending.push(fiber.sibling);
                 if (fiber.child) pending.push(fiber.child);
-                if (typeof fiber.type !== "function" || !fiber.memoizedProps) continue;
-                const result = matchComponent(fiber);
-                if (result !== undefined) return result;
+                const props = fiber.memoizedProps;
+                if (
+                    typeof fiber.type === "function" &&
+                    props &&
+                    Array.isArray(props.childSections) &&
+                    "eSortBy" in props &&
+                    "elScrollElement" in props
+                ) {
+                    gridFiber = fiber;
+                    break;
+                }
+            }
+            if (!gridFiber) return null;
+            const hooks = [];
+            for (let hook = gridFiber.memoizedState; hook && hooks.length < 5; hook = hook.next) hooks.push(hook);
+            if (hooks.length < 5) return null;
+            const [sectionHook, itemHook, tileMapHook, labelHook, placeholderHook] = hooks;
+            const isRef = (value) => value && typeof value === "object" && "current" in value;
+            const tileMap = isRef(tileMapHook.memoizedState) && tileMapHook.memoizedState.current;
+            const looksRight =
+                isRef(sectionHook.memoizedState) &&
+                isRef(itemHook.memoizedState) &&
+                tileMap &&
+                typeof tileMap.get === "function" &&
+                typeof tileMap.entries === "function" &&
+                labelHook.queue &&
+                typeof labelHook.queue.dispatch === "function" &&
+                typeof labelHook.queue.lastRenderedState === "string" &&
+                isRef(placeholderHook.memoizedState);
+            if (!looksRight) return null;
+            const props = gridFiber.memoizedProps;
+            return {
+                sections: props.childSections,
+                sortBy: props.eSortBy,
+                scrollElement: props.elScrollElement || scrollerElement,
+                sectionRef: sectionHook.memoizedState,
+                itemRef: itemHook.memoizedState,
+                tileMap,
+                labelQueue: labelHook.queue,
+                placeholderNavRef: placeholderHook.memoizedState.current,
+            };
+        };
+
+        const localize = (token) => {
+            try {
+                const manager = window.LocalizationManager || (window.opener && window.opener.LocalizationManager);
+                const text = manager && manager.LocalizeString(token);
+                return typeof text === "string" && text && text !== token ? text : null;
+            } catch (error) {
+                return null;
+            }
+        };
+        const letterOf = (sortAs) => {
+            const firstCharacter = String(sortAs || "").normalize("NFD").charAt(0).toLowerCase();
+            return !firstCharacter || firstCharacter < "a" ? "#" : firstCharacter;
+        };
+
+        // Groups in list order, each { key, label, sectionIndex, itemIndex } where the item is the group's first game.
+        // Matches Steam's own stepping: several sections step section by section; one section steps by letter (A-Z), by
+        // completion percentage (Achievements) or by friends playing (then by letter); other one-section sorts don't step (null).
+        const buildGroups = (grid) => {
+            const groups = [];
+            const keyToGroup = new Map();
+            const addGroup = (key, label, sectionIndex, itemIndex) => {
+                if (keyToGroup.has(key)) return;
+                const group = { key, label, sectionIndex, itemIndex };
+                keyToGroup.set(key, group);
+                groups.push(group);
+            };
+            if (grid.sections.length > 1) {
+                grid.sections.forEach((section, sectionIndex) => {
+                    if (section && section.children && section.children.length)
+                        addGroup("section:" + sectionIndex, String(section.subSectionName || ""), sectionIndex, 0);
+                });
+                return { groups, groupKeyAt: (sectionIndex) => "section:" + sectionIndex };
+            }
+            const apps = (grid.sections[0] && grid.sections[0].children) || [];
+            let groupKeyAndLabel;
+            if (grid.sortBy === config.SORT_ALPHABETICAL) {
+                groupKeyAndLabel = (app) => {
+                    const letter = letterOf(app.sort_as);
+                    return ["letter:" + letter, letter];
+                };
+            } else if (grid.sortBy === config.SORT_ACHIEVEMENTS) {
+                groupKeyAndLabel = (app) => {
+                    const percent = app.GetAchievementPercentage();
+                    const label =
+                        percent === -1
+                            ? localize("#Library_SortByPctAchievementsNoAchievements_Tag") || "-"
+                            : (localize("#Library_SortByPctAchievementsComplete_Tag") || "%1$s%").replace("%1$s", percent);
+                    return ["percent:" + percent, label];
+                };
+            } else if (grid.sortBy === config.SORT_FRIENDS_PLAYING) {
+                groupKeyAndLabel = (app) => {
+                    const friendsPlaying = app.GetFriendsPlaying();
+                    if (!friendsPlaying) {
+                        const letter = letterOf(app.sort_as);
+                        return ["letter:" + letter, letter];
+                    }
+                    const template =
+                        (friendsPlaying !== 1 && localize("#AppPortraitHover_FriendsPlaying_Plural")) ||
+                        localize("#AppPortraitHover_FriendsPlaying") ||
+                        "%1$s";
+                    return ["friends:" + friendsPlaying, template.replace("%1$s", friendsPlaying)];
+                };
+            } else return null;
+            const itemKeys = apps.map((app) => {
+                const [key, label] = groupKeyAndLabel(app);
+                return { key, label };
+            });
+            itemKeys.forEach(({ key, label }, itemIndex) => addGroup(key, label, 0, itemIndex));
+            return { groups, groupKeyAt: (sectionIndex, itemIndex) => itemKeys[itemIndex] && itemKeys[itemIndex].key };
+        };
+
+        // Same formula Steam's fast scroll uses for its scroll target.
+        const scrollTopFor = (grid, sectionIndex, itemIndex) => {
+            const section = grid.sections[sectionIndex];
+            const sectionElement = section && section.refSection && section.refSection.current;
+            const itemsPerRow = section && section.refItemsPerRow && section.refItemsPerRow.current;
+            if (!sectionElement || !itemsPerRow) return null;
+            const row = Math.floor(itemIndex / itemsPerRow);
+            const scrollPaddingTop =
+                parseInt(getComputedStyle(grid.scrollElement).getPropertyValue("scroll-padding-top")) || 0;
+            return sectionElement.offsetTop + row * (section.childHeight + section.nGridRowGap) - scrollPaddingTop + 8;
+        };
+
+        const parseTileKey = (key) => {
+            const match = /^(\d+)_(\d+)$/.exec(key);
+            return match ? { sectionIndex: +match[1], itemIndex: +match[2] } : null;
+        };
+        const tileHasFocus = (tileNavRef) => {
+            try {
+                return !!(tileNavRef && tileNavRef.BHasFocus());
+            } catch (error) {
+                return false;
+            }
+        };
+
+        // The focused tile; else Steam's refs (set on every tile focus, cleared when focus leaves the grid); else the first tile in view.
+        const currentPosition = (grid) => {
+            for (const [key, tileNavRef] of grid.tileMap.entries())
+                if (tileHasFocus(tileNavRef) && parseTileKey(key)) return parseTileKey(key);
+            const sectionIndex = grid.sectionRef.current,
+                itemIndex = grid.itemRef.current;
+            if (
+                typeof sectionIndex === "number" &&
+                typeof itemIndex === "number" &&
+                grid.sections[sectionIndex] &&
+                itemIndex < grid.sections[sectionIndex].children.length
+            )
+                return { sectionIndex, itemIndex };
+            let firstInView = null;
+            for (const key of grid.tileMap.keys()) {
+                const position = parseTileKey(key);
+                if (!position) continue;
+                const top = scrollTopFor(grid, position.sectionIndex, position.itemIndex);
+                if (top === null || top < grid.scrollElement.scrollTop - 10) continue;
+                if (
+                    !firstInView ||
+                    position.sectionIndex < firstInView.sectionIndex ||
+                    (position.sectionIndex === firstInView.sectionIndex && position.itemIndex < firstInView.itemIndex)
+                )
+                    firstInView = position;
+            }
+            return firstInView;
+        };
+
+        const setLabel = (grid, text) => {
+            clearTimeout(state.labelClearTimer);
+            try {
+                grid.labelQueue.dispatch(text);
+            } catch (error) {}
+        };
+        const clearLabelSoon = (grid) => {
+            clearTimeout(state.labelClearTimer);
+            state.labelClearTimer = setTimeout(() => {
+                if (!state.heldButton) setLabel(grid, "");
+            }, config.LABEL_LINGER_MS);
+        };
+
+        // Scrolls to the group's first game and focuses it. The grid only mounts tiles near the viewport, and right after a fresh
+        // load its height can still be growing, so retry each frame until the tile is mounted and focused.
+        const landOn = (grid, group) => {
+            const thisLandingId = ++state.landingId;
+            const tileKey = group.sectionIndex + "_" + group.itemIndex;
+            // Steam's own refs: with them set, Steam itself focuses the tile as soon as it mounts.
+            grid.sectionRef.current = group.sectionIndex;
+            grid.itemRef.current = group.itemIndex;
+            const currentTile = [...grid.tileMap.values()].find(tileHasFocus);
+            if (currentTile !== grid.tileMap.get(tileKey)) {
+                // Park focus on the overlay first (as Steam does), so focus never drops out of the grid when the old tile unmounts.
+                try {
+                    if (grid.placeholderNavRef && grid.placeholderNavRef.current) grid.placeholderNavRef.current.TakeFocus();
+                } catch (error) {}
+            }
+            const startedAt = performance.now();
+            const attempt = () => {
+                if (thisLandingId !== state.landingId || state.heldButton) return;
+                const targetTile = grid.tileMap.get(tileKey);
+                if (targetTile && tileHasFocus(targetTile)) return clearLabelSoon(grid);
+                const wantedTop = scrollTopFor(grid, group.sectionIndex, group.itemIndex);
+                if (wantedTop !== null && Math.abs(grid.scrollElement.scrollTop - wantedTop) > 2)
+                    grid.scrollElement.scrollTo({ top: wantedTop, behavior: "instant" });
+                if (targetTile) {
+                    try {
+                        targetTile.TakeFocus();
+                    } catch (error) {}
+                }
+                if (performance.now() - startedAt > config.LAND_TIMEOUT_MS) {
+                    console.warn("[library-jump] could not focus", tileKey, "after", config.LAND_TIMEOUT_MS, "ms");
+                    return clearLabelSoon(grid);
+                }
+                requestAnimationFrame(attempt);
+            };
+            attempt();
+        };
+
+        // Switching library tabs (or opening a game and coming back) remounts the grid. Steam then restores focus from its
+        // saved nav history: the tile's NavKey (appportrait_<appid>) if that tile is mounted, else the old *index* among the
+        // mounted tiles. The grid mounts only ~70 tiles, so after a long jump that index points at a different game, and
+        // focusing it scrolls the grid there. We remember the last focused tile per tab and, on the first focus in a new
+        // grid, move focus back to it when Steam picked another one.
+        const tabNameOf = (scrollerElement) => {
+            const fiberKey = Object.keys(scrollerElement).find((key) => key.startsWith("__reactFiber$"));
+            for (let fiber = fiberKey && scrollerElement[fiberKey]; fiber; fiber = fiber.return) {
+                const props = fiber.memoizedProps;
+                if (props && "parentOnScroll" in props && typeof props.name === "string") return props.name;
             }
             return null;
         };
-
-        const originalScrollTo = Element.prototype.scrollTo;
-        const originalFocus = HTMLElement.prototype.focus;
-        const originalScrollIntoView = Element.prototype.scrollIntoView;
-        const originalScrollTopDescriptor = Object.getOwnPropertyDescriptor(
-            Element.prototype,
-            "scrollTop",
-        );
-
-        let jumpAnimation = null;
-        const cancelJumpAnimation = () => {
-            if (jumpAnimation) {
-                jumpAnimation.cancelled = true;
-                jumpAnimation = null;
+        const tileKeyOfElement = (grid, element) => {
+            for (const [key, tileNavRef] of grid.tileMap.entries()) {
+                try {
+                    const tileElement = tileNavRef.Node().m_element;
+                    if (tileElement && tileElement.contains(element)) return key;
+                } catch (error) {}
             }
+            return null;
         };
-
-        const animateScrollTo = (scrollerElement, targetTop) => {
-            cancelJumpAnimation();
-            const thisAnimation = (jumpAnimation = { cancelled: false });
-            const fromTop = scrollerElement.scrollTop,
-                startTime = performance.now(),
-                durationMs = Math.max(1, config.ANIM_MS);
-            const frame = (now) => {
-                if (thisAnimation.cancelled) return;
-                const progress = Math.min(1, (now - startTime) / durationMs);
-                originalScrollTo.call(scrollerElement, {
-                    top: fromTop + (targetTop - fromTop) * (1 - Math.pow(1 - progress, 3)),
-                    behavior: "instant",
-                });
-                if (progress < 1) requestAnimationFrame(frame);
-                else if (jumpAnimation === thisAnimation) jumpAnimation = null;
-            };
-            requestAnimationFrame(frame);
+        const appAt = (grid, sectionIndex, itemIndex) => {
+            const section = grid.sections[sectionIndex];
+            return (section && section.children && section.children[itemIndex]) || null;
         };
-
-
-        let interceptedScroller = null;
-        const interceptScrolling = (scrollerElement) => {
-            if (interceptedScroller === scrollerElement) return;
-            restoreScrolling();
-            Object.defineProperty(scrollerElement, "scrollTop", {
-                configurable: true,
-                get() {
-                    return originalScrollTopDescriptor.get.call(this);
-                },
-                set(value) {
-                    state.scrollFocusCalls++;
-                    if (state.swallowScroll) state.lastScrollTarget = value;
-                    else originalScrollTopDescriptor.set.call(this, value);
-                },
-            });
-            scrollerElement.scrollTo = function (options) {
-                if (state.swallowScroll && options && typeof options.top === "number") {
-                    state.scrollFocusCalls++;
-                    state.lastScrollTarget = options.top;
-                } else originalScrollTo.apply(this, arguments);
-            };
-            HTMLElement.prototype.focus = function (options) {
-                if (scrollerElement.contains(this)) {
-                    state.scrollFocusCalls++;
-                    if (state.swallowScroll)
-                        return originalFocus.call(this, {
-                            ...(options || {}),
-                            preventScroll: true,
-                        });
-                }
-                return originalFocus.apply(this, arguments);
-            };
-            // Steam's focus handler also smooth-scrolls (~0 and ~370 ms after a step): ignore it during and just after a hold.
-            Element.prototype.scrollIntoView = function () {
-                if (
-                    scrollerElement.contains(this) &&
-                    (state.swallowScroll || performance.now() < state.ignoreScrollIntoViewUntil)
-                )
+        // Where the remembered game is now; it is looked up by app id in case the list changed while the tab was away.
+        const findRememberedTile = (grid, remembered) => {
+            const appAtSavedPosition = appAt(grid, remembered.sectionIndex, remembered.itemIndex);
+            if (appAtSavedPosition && appAtSavedPosition.appid === remembered.appid)
+                return { sectionIndex: remembered.sectionIndex, itemIndex: remembered.itemIndex };
+            for (let sectionIndex = 0; sectionIndex < grid.sections.length; sectionIndex++) {
+                const apps = (grid.sections[sectionIndex] && grid.sections[sectionIndex].children) || [];
+                const itemIndex = apps.findIndex((app) => app && app.appid === remembered.appid);
+                if (itemIndex !== -1) return { sectionIndex, itemIndex };
+            }
+            return null;
+        };
+        const onFocusIn = (event) => {
+            const scrollerElement = getGridScroller();
+            if (!scrollerElement || !(event.target instanceof Node) || !scrollerElement.contains(event.target)) return;
+            const grid = readSteamGrid();
+            if (!grid) return;
+            const focusedKey = tileKeyOfElement(grid, event.target);
+            const focusedPosition = focusedKey && parseTileKey(focusedKey);
+            if (!focusedPosition) return; // the overlay placeholder, not a tile
+            const tabName = tabNameOf(scrollerElement) || "";
+            const isNewGrid = !state.knownScrollers.has(scrollerElement);
+            state.knownScrollers.add(scrollerElement);
+            const remembered = state.focusedTileByTab.get(tabName);
+            if (isNewGrid && remembered && remembered.sortBy === grid.sortBy && !state.heldButton) {
+                const rememberedPosition = findRememberedTile(grid, remembered);
+                const isOtherTile =
+                    rememberedPosition &&
+                    (rememberedPosition.sectionIndex !== focusedPosition.sectionIndex ||
+                        rememberedPosition.itemIndex !== focusedPosition.itemIndex);
+                if (isOtherTile) {
+                    // After Steam's restore has finished; the landing's own focus event then records the position.
+                    requestAnimationFrame(() => landOn(readSteamGrid() || grid, rememberedPosition));
                     return;
-                return originalScrollIntoView.apply(this, arguments);
-            };
-            interceptedScroller = scrollerElement;
-        };
-        const restoreScrolling = () => {
-            if (!interceptedScroller) return;
-            delete interceptedScroller.scrollTop;
-            delete interceptedScroller.scrollTo;
-            HTMLElement.prototype.focus = originalFocus;
-            Element.prototype.scrollIntoView = originalScrollIntoView;
-            interceptedScroller = null;
-        };
-
-        // The grid is virtualised and can end up a few hundred px off after a long scroll, so re-snap shortly after a jump.
-        const settleAfterJump = (scrollerElement, targetTop) => {
-            const thisSettleId = ++state.settleId;
-            const snapIfOff = () => {
-                if (state.settleId !== thisSettleId || state.heldButton) return;
-                const maxTop = Math.max(0, scrollerElement.scrollHeight - scrollerElement.clientHeight),
-                    wantedTop = Math.min(maxTop, Math.max(0, targetTop));
-                if (Math.abs(scrollerElement.scrollTop - wantedTop) > 2)
-                    originalScrollTo.call(scrollerElement, { top: wantedTop, behavior: "instant" });
-            };
-            [config.ANIM_MS + 120, config.ANIM_MS + 500, config.ANIM_MS + 900].forEach((delay) =>
-                setTimeout(snapIfOff, delay),
-            );
-        };
-
-        const jumpToLastTarget = () => {
-            const scrollerElement = getGridScroller();
-            if (!scrollerElement || state.lastScrollTarget == null) return;
-            if (
-                !isAnimatorActive() &&
-                Math.abs(state.lastScrollTarget - scrollerElement.scrollTop) > 1
-            ) {
-                animateScrollTo(scrollerElement, state.lastScrollTarget);
-                settleAfterJump(scrollerElement, state.lastScrollTarget);
-            }
-        };
-
-        // Steam clears the label ~100-160 ms after each step, which would flicker between our steps.
-        let labelQueue = null,
-            originalReducer = null,
-            originalDispatch = null,
-            wrappedDispatch = null;
-        let labelActive = false,
-            labelClearTimer = null,
-            lastLabel = "",
-            labelWatchFrame = null;
-
-        const findLabelQueue = () =>
-            findSteamGridHook((fiber) => {
-                if (!("eSortBy" in fiber.memoizedProps)) return undefined;
-                for (let hook = fiber.memoizedState, index = 0; hook && index < 60; hook = hook.next, index++)
-                    if (
-                        hook.queue &&
-                        typeof hook.queue.dispatch === "function" &&
-                        hook.queue.lastRenderedState === ""
-                    )
-                        return hook.queue;
-                return undefined;
-            });
-        const setLabel = (text) => {
-            if (originalDispatch) originalDispatch(text);
-        };
-        const currentLabel = () => (labelQueue ? labelQueue.lastRenderedState : "");
-
-        const uninstallLabelGuard = () => {
-            if (!labelQueue) return;
-            try {
-                delete labelQueue.lastRenderedReducer;
-                labelQueue.lastRenderedReducer = originalReducer;
-                if (labelQueue.dispatch === wrappedDispatch) labelQueue.dispatch = originalDispatch;
-            } catch (e) {}
-            labelQueue = null;
-        };
-        const installLabelGuard = () => {
-            const queue = findLabelQueue();
-            if (!queue || queue === labelQueue) return;
-            uninstallLabelGuard();
-            labelQueue = queue;
-            originalReducer = queue.lastRenderedReducer;
-            originalDispatch = queue.dispatch;
-            wrappedDispatch = function (action) {
-                if (action === "" && labelActive) return;
-                return originalDispatch.apply(this, arguments);
-            };
-            queue.dispatch = wrappedDispatch;
-            if (!state.heldButton) {
-                // re-render once so Steam's closures pick up the wrapper before the first step
-                originalDispatch(" ");
-                originalDispatch("");
-            }
-            Object.defineProperty(queue, "lastRenderedReducer", {
-                configurable: true,
-                get() {
-                    return (current, action) =>
-                        action === "" && labelActive ? current : originalReducer(current, action);
-                },
-                set(value) {
-                    originalReducer = value;
-                },
-            });
-        };
-        // Clears applied during render slip past the guards, so also re-assert the last label every frame.
-        const watchLabel = () => {
-            labelWatchFrame = null;
-            if (!labelActive || !labelQueue) return;
-            const current = labelQueue.lastRenderedState;
-            if (current) lastLabel = current;
-            else if (lastLabel) setLabel(lastLabel);
-            labelWatchFrame = requestAnimationFrame(watchLabel);
-        };
-        const holdLabel = () => {
-            if (!labelActive) lastLabel = "";
-            labelActive = true;
-            clearTimeout(labelClearTimer);
-            if (!labelWatchFrame) labelWatchFrame = requestAnimationFrame(watchLabel);
-        };
-        const releaseLabel = () => {
-            clearTimeout(labelClearTimer);
-            labelClearTimer = setTimeout(() => {
-                labelActive = false;
-                lastLabel = "";
-                setLabel("");
-            }, config.OVERLAY_LINGER_MS);
-        };
-
-        // Learns which footer labels Steam hides on a step, then keeps them hidden until release.
-        const footerTextsToHide = new Set();
-        let footerObserver = null;
-        const footerTexts = () => {
-            const scrollerElement = getGridScroller();
-            const leafElements = [...document.querySelectorAll("body *")].filter(
-                (element) =>
-                    element.children.length === 0 &&
-                    element.textContent &&
-                    element.textContent.trim().length < 20 &&
-                    !(scrollerElement && scrollerElement.contains(element)) &&
-                    element.getClientRects().length > 0,
-            );
-            return new Set(leafElements.map((element) => element.textContent.trim()));
-        };
-        const learnFooterLabelsToHide = (textsBeforeStep) =>
-            setTimeout(() => {
-                const textsNow = footerTexts();
-                for (const text of textsBeforeStep)
-                    if (!textsNow.has(text)) footerTextsToHide.add(text);
-            }, 150);
-        const hideLearnedFooterElements = () => {
-            if (!state.heldButton) return;
-            const scrollerElement = getGridScroller();
-            for (const element of document.querySelectorAll("body *")) {
-                const container = element.parentElement;
-                if (
-                    element.children.length !== 0 ||
-                    !footerTextsToHide.has((element.textContent || "").trim()) ||
-                    !container ||
-                    container.hasAttribute("data-hj")
-                )
-                    continue;
-                if (scrollerElement && scrollerElement.contains(element)) continue;
-                container.setAttribute("data-hj", container.style.display || ""); // remembers the old value for showFooter
-                container.style.display = "none";
-            }
-        };
-        const hideFooter = () => {
-            if (!footerTextsToHide.size || footerObserver) return;
-            footerObserver = new MutationObserver(hideLearnedFooterElements);
-            footerObserver.observe(document.body, {
-                childList: true,
-                subtree: true,
-                characterData: true,
-            });
-            hideLearnedFooterElements();
-        };
-        const showFooter = () => {
-            if (footerObserver) {
-                footerObserver.disconnect();
-                footerObserver = null;
-            }
-            for (const element of document.querySelectorAll("[data-hj]")) {
-                element.style.display = element.getAttribute("data-hj");
-                element.removeAttribute("data-hj");
-            }
-        };
-
-        // A useRef holding an object with End() and m_bActive.
-        let animatorRef = null;
-        const findAnimatorRef = () => {
-            if (animatorRef) return animatorRef;
-            return findSteamGridHook((fiber) => {
-                if (!("childSections" in fiber.memoizedProps) || !("eSortBy" in fiber.memoizedProps))
-                    return undefined;
-                for (let hook = fiber.memoizedState, index = 0; hook && index < 80; hook = hook.next, index++) {
-                    const ref = hook.memoizedState;
-                    if (
-                        ref &&
-                        typeof ref === "object" &&
-                        "current" in ref &&
-                        Object.keys(ref).length === 1 &&
-                        ref.current &&
-                        typeof ref.current.End === "function" &&
-                        "m_bActive" in ref.current
-                    )
-                        return (animatorRef = ref);
                 }
-                return undefined;
-            });
-        };
-        const isAnimatorActive = () =>
-            !!(animatorRef && animatorRef.current && animatorRef.current.m_bActive);
-        const endAnimatorNow = () => {
-            if (isAnimatorActive()) {
-                try {
-                    animatorRef.current.End();
-                } catch (e) {}
             }
-        };
-        // Ending the animator soon after each step is what lets the next paced step be accepted (allows 150 ms steps).
-        const endAnimatorSoon = () => {
-            if (config.FAST_END_MS < 0) return;
-            const ref = findAnimatorRef();
-            if (!ref || !ref.current) return;
-            const animator = ref.current;
-            setTimeout(() => {
-                try {
-                    if (ref.current === animator && animator.m_bActive) animator.End();
-                } catch (e) {}
-            }, config.FAST_END_MS);
-        };
-
-        // Fills Steam's section/item refs (undefined after a sort change) from the focused tile, so Steam can see boundaries.
-        const primeSteamPositionRefs = () =>
-            findSteamGridHook((fiber) => {
-                if (!("childSections" in fiber.memoizedProps) || !("eSortBy" in fiber.memoizedProps))
-                    return undefined;
-                const hook0 = fiber.memoizedState,
-                    hook1 = hook0 && hook0.next,
-                    hook2 = hook1 && hook1.next;
-                if (!hook2) return undefined;
-                const sectionRef = hook0.memoizedState,
-                    itemRef = hook1.memoizedState,
-                    tileMap = hook2.memoizedState;
-                const looksRight =
-                    sectionRef &&
-                    typeof sectionRef === "object" &&
-                    "current" in sectionRef &&
-                    itemRef &&
-                    typeof itemRef === "object" &&
-                    "current" in itemRef &&
-                    tileMap &&
-                    tileMap.current &&
-                    typeof tileMap.current.entries === "function" &&
-                    typeof tileMap.current.get === "function" &&
-                    "size" in tileMap.current;
-                if (!looksRight) return undefined;
-                if (sectionRef.current !== undefined && itemRef.current !== undefined) return true;
-                for (const [key, tileNavRef] of tileMap.current) {
-                    let hasFocus = false;
-                    try {
-                        hasFocus = !!(
-                            tileNavRef &&
-                            typeof tileNavRef.BHasFocus === "function" &&
-                            tileNavRef.BHasFocus()
-                        );
-                    } catch (e) {}
-                    const match = /^(\d+)_(\d+)$/.exec(key);
-                    if (hasFocus && match) {
-                        sectionRef.current = +match[1];
-                        itemRef.current = +match[2];
-                        return true;
-                    }
-                }
-                return false; // no focused tile to copy from
+            const focusedApp = appAt(grid, focusedPosition.sectionIndex, focusedPosition.itemIndex);
+            state.focusedTileByTab.set(tabName, {
+                sectionIndex: focusedPosition.sectionIndex,
+                itemIndex: focusedPosition.itemIndex,
+                appid: focusedApp && focusedApp.appid,
+                sortBy: grid.sortBy,
             });
-
-        // Re-fires the press for Steam's own handler to step. Returns true if the step was accepted.
-        const dispatchSteamStep = (detail, fallbackTarget, synchronous) => {
-            const scrollerElement = getGridScroller();
-            if (!scrollerElement) return false;
-            interceptScrolling(scrollerElement);
-            installLabelGuard();
-            holdLabel();
-            state.swallowScroll = true;
-            const callsBefore = state.scrollFocusCalls,
-                animatorWasActive = isAnimatorActive();
-            if (state.heldButton && !state.hasStepped) {
-                state.hasStepped = true;
-                if (!footerTextsToHide.size) learnFooterLabelsToHide(footerTexts());
-            }
-            const target =
-                document.activeElement && scrollerElement.contains(document.activeElement)
-                    ? document.activeElement
-                    : fallbackTarget;
-            const pressEvent = new CustomEvent("vgp_onbuttondown", {
-                bubbles: true,
-                cancelable: true,
-                composed: true,
-                detail: { ...detail, is_repeat: false },
-            });
-            pressEvent.isOurOwnStep = true;
-            target.dispatchEvent(pressEvent);
-            // defaultPrevented: Steam took the press, as a real step or a refusal at a boundary (false = sort has no stepping)
-            state.steamHandledPress = pressEvent.defaultPrevented;
-            const animator = findAnimatorRef();
-            const startedAnimator = !!(
-                animator &&
-                animator.current &&
-                animator.current.m_bActive &&
-                !animatorWasActive
-            );
-            state.animatorWasActive = animatorWasActive;
-            if (synchronous) {
-                if (startedAnimator) {
-                    try {
-                        animator.current.End();
-                    } catch (e) {}
-                }
-            } else endAnimatorSoon();
-            return state.scrollFocusCalls !== callsBefore || startedAnimator;
-        };
-        // A step counts as accepted if Steam scrolled/focused during the dispatch, or its label changed shortly after.
-        const tryStep = (detail, target, done) => {
-            const labelBefore = currentLabel();
-            if (dispatchSteamStep(detail, target)) return done(true);
-            setTimeout(() => {
-                const labelAfter = currentLabel();
-                done(!!labelAfter && labelAfter !== labelBefore);
-            }, config.LABEL_CHECK_MS);
         };
 
         const stopRepeating = () => {
             clearTimeout(state.repeatTimer);
             state.repeatTimer = null;
-            state.heldButton = null;
         };
-        // Repeats steps while held; stops once Steam keeps refusing (end of list).
-        const scheduleRepeat = (detail, target, isFirstRepeat, timeSpentMs) => {
-            const intervalMs = isFirstRepeat ? config.HOLD_DELAY_MS : config.START_INTERVAL_MS;
-            const scheduledAt = performance.now();
-            const attempt = () => {
-                if (!state.heldButton) return;
-                const attemptStartedAt = performance.now();
-                tryStep(detail, target, (accepted) => {
-                    if (!state.heldButton) return;
-                    if (accepted) {
-                        scheduleRepeat(detail, target, false, performance.now() - attemptStartedAt);
-                        return;
-                    }
-                    if (performance.now() - scheduledAt > intervalMs + config.GIVE_UP_MS) return;
-                    state.repeatTimer = setTimeout(attempt, config.RETRY_MS);
-                });
-            };
-            state.repeatTimer = setTimeout(attempt, Math.max(0, intervalMs - (timeSpentMs || 0)));
-        };
-
-        // Steps the opposite way until Steam refuses (the far end), then jumps there once.
-        const wrapAround = (button, target) => {
-            const oppositeButton = button === config.BTN_R2 ? config.BTN_L2 : config.BTN_R2;
-            let steps = 0;
-            while (steps < 300 && dispatchSteamStep({ button: oppositeButton }, target, true)) steps++;
-            if (!steps) {
-                state.swallowScroll = false;
-                return false;
-            }
-            hideFooter();
-            setTimeout(() => {
-                showFooter();
-                state.swallowScroll = false;
-                state.ignoreScrollIntoViewUntil = performance.now() + 500;
-                releaseLabel();
-                jumpToLastTarget();
-            }, 40);
-            return true;
-        };
-
-        const isInsideGrid = (event) => {
-            const scrollerElement = getGridScroller();
-            return (
-                scrollerElement &&
-                event.target instanceof Node &&
-                scrollerElement.contains(event.target)
-            );
-        };
-        const isTriggerButton = (button) => button === config.BTN_R2 || button === config.BTN_L2;
-
-        const onButtonDown = (event) => {
-            if (event.isOurOwnStep) return;
-            const button = event.detail && event.detail.button;
-            if (!isTriggerButton(button)) return;
-            if (!state.heldButton && !isInsideGrid(event)) return;
-            event.stopImmediatePropagation();
-            event.preventDefault(); // Steam's native handler must not also run
-            if (event.detail.is_repeat || state.heldButton) return;
-            try {
-                primeSteamPositionRefs();
-            } catch (error) {}
-            state.heldButton = button;
-            state.lastScrollTarget = null;
-            state.hasStepped = false;
-            state.steamHandledPress = false;
-            const detail = { button };
-            const target = event.target;
-            tryStep(detail, target, (accepted) => {
-                if (state.heldButton !== button) return;
-                if (!accepted) {
-                    // Wrap only if Steam refused at a boundary, nothing was animating, and no hold just ended at the end.
-                    const canWrap =
-                        config.WRAP_ON_TAP &&
-                        state.steamHandledPress &&
-                        !state.animatorWasActive &&
-                        performance.now() - state.lastReleaseAt > config.WRAP_MIN_GAP_MS;
-                    stopRepeating();
-                    showFooter();
-                    state.swallowScroll = false;
-                    if (canWrap) {
-                        state.lastScrollTarget = null;
-                        wrapAround(button, target);
-                    }
+        const scheduleRepeat = (direction, delayMs) => {
+            state.repeatTimer = setTimeout(() => {
+                const press = state.press;
+                if (!state.heldButton || !press) return;
+                const nextIndex = press.groupIndex + direction;
+                if (nextIndex < 0 || nextIndex >= press.groups.length) {
+                    press.stoppedAtEnd = true; // holding never wraps
                     return;
                 }
-                hideFooter(); // only once Steam really stepped, so a refused press never touches the footer
-                scheduleRepeat(detail, target, true);
-            });
+                press.groupIndex = nextIndex;
+                setLabel(press.grid, press.groups[nextIndex].label);
+                scheduleRepeat(direction, config.START_INTERVAL_MS);
+            }, delayMs);
+        };
+
+        const isTriggerButton = (button) => button === config.BTN_R2 || button === config.BTN_L2;
+        const swallow = (event) => {
+            event.stopImmediatePropagation();
+            event.preventDefault(); // Steam's own fast-scroll handler must not also run
+        };
+
+        const onButtonDown = (event) => {
+            const button = event.detail && event.detail.button;
+            if (!isTriggerButton(button)) return;
+            if (state.heldButton) return swallow(event); // repeats, or the other trigger while one is held
+            const scrollerElement = getGridScroller();
+            if (!scrollerElement || !(event.target instanceof Node) || !scrollerElement.contains(event.target)) return;
+            const grid = readSteamGrid();
+            if (!grid) {
+                if (!state.warnedGridNotFound) console.warn("[library-jump] library grid not recognised; Steam handles R2/L2");
+                state.warnedGridNotFound = true;
+                return;
+            }
+            const grouping = buildGroups(grid);
+            if (!grouping || !grouping.groups.length) return; // a sort Steam doesn't step either (e.g. Date Added)
+            swallow(event);
+            if (event.detail.is_repeat) return;
+            const position = currentPosition(grid);
+            if (!position) return;
+            const { groups } = grouping;
+            const direction = button === config.BTN_R2 ? 1 : -1;
+            const currentKey = grouping.groupKeyAt(position.sectionIndex, position.itemIndex);
+            const currentIndex = groups.findIndex((group) => group.key === currentKey);
+            let groupIndex = (currentIndex === -1 ? 0 : currentIndex) + direction;
+            let wrapped = false;
+            if (groupIndex < 0 || groupIndex >= groups.length) {
+                const justStoppedAtEnd =
+                    state.lastRelease.holdStoppedAtEnd &&
+                    performance.now() - state.lastRelease.at < config.WRAP_MIN_GAP_MS;
+                if (!config.WRAP_ON_TAP || justStoppedAtEnd || groups.length < 2) return;
+                groupIndex = direction > 0 ? 0 : groups.length - 1;
+                wrapped = true;
+            }
+            state.landingId++; // cancel a landing still in progress
+            state.heldButton = button;
+            state.press = { grid, groups, groupIndex, wrapped, stoppedAtEnd: false };
+            setLabel(grid, groups[groupIndex].label);
+            if (!wrapped) scheduleRepeat(direction, config.HOLD_DELAY_MS); // a press that wraps doesn't repeat
         };
 
         const onButtonUp = (event) => {
             const button = event.detail && event.detail.button;
-            if (!isTriggerButton(button)) return;
-            state.lastReleaseAt = performance.now();
+            if (!isTriggerButton(button) || !state.heldButton) return;
+            swallow(event);
             if (state.heldButton !== button) return;
-            event.stopImmediatePropagation();
             stopRepeating();
-            showFooter();
-            // Commit a step still animating while scrolls are swallowed, then release one tick later and jump once.
-            endAnimatorNow();
-            state.ignoreScrollIntoViewUntil = performance.now() + 600;
-            clearTimeout(state.releaseTimer);
-            state.releaseTimer = setTimeout(() => {
-                if (state.heldButton) return; // a new press already started
-                state.swallowScroll = false;
-                state.ignoreScrollIntoViewUntil = performance.now() + 500;
-                releaseLabel();
-                jumpToLastTarget();
-            }, 30);
+            const press = state.press;
+            state.heldButton = null;
+            state.press = null;
+            state.lastRelease = { at: performance.now(), holdStoppedAtEnd: press.stoppedAtEnd };
+            landOn(press.grid, press.groups[press.groupIndex]);
         };
 
-        // The grid is rebuilt on sort change or remount, so keep the label guard on the current one.
-        const guardRefreshTimer = setInterval(() => {
-            if (!state.heldButton && getGridScroller()) installLabelGuard();
-        }, 1000);
-        installLabelGuard();
         window.addEventListener("vgp_onbuttondown", onButtonDown, true); // capture: runs before Steam's handlers
         window.addEventListener("vgp_onbuttonup", onButtonUp, true);
+        window.addEventListener("focusin", onFocusIn, true);
         window.libraryJump = {
             config,
             state,
-            label: () => (labelQueue ? labelQueue.lastRenderedState : null),
+            label: () => {
+                const grid = readSteamGrid();
+                return grid ? grid.labelQueue.lastRenderedState : null;
+            },
             undo() {
                 window.removeEventListener("vgp_onbuttondown", onButtonDown, true);
                 window.removeEventListener("vgp_onbuttonup", onButtonUp, true);
-                clearInterval(guardRefreshTimer);
-                animatorRef = null;
+                window.removeEventListener("focusin", onFocusIn, true);
                 stopRepeating();
-                showFooter();
-                state.swallowScroll = false;
-                cancelJumpAnimation();
-                clearTimeout(labelClearTimer);
-                labelActive = false;
-                if (labelWatchFrame) cancelAnimationFrame(labelWatchFrame);
-                setLabel("");
-                uninstallLabelGuard();
-                restoreScrolling();
+                state.landingId++;
+                clearTimeout(state.labelClearTimer);
+                const grid = state.press && state.press.grid;
+                state.heldButton = null;
+                state.press = null;
+                if (grid) setLabel(grid, "");
                 delete window.libraryJump;
                 return "undone (bpm)";
             },

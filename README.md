@@ -21,7 +21,7 @@ Within your Steam library, hold R2 (forward) or L2 (back). Settings are in the Q
 
 ## How it works
 
-The plugin runs in Steam's SharedJSContext and evaluates a small script inside the Big Picture window (found with `findSP()`), where Steam's library lives. The script captures the R2/L2 gamepad events, lets Steam's own section-jump handler do each step, repeats it while the button is held, defers scrolling until release, and finishes Steam's scroll animation early so steps can come quickly. Everything is found by shape (props, hooks, method names), never by minified names, and removed completely when the plugin unloads.
+The plugin runs in Steam's SharedJSContext and evaluates a small script inside the Big Picture window (found with `findSP()`), where Steam's library lives. The script captures the R2/L2 gamepad events and reads the same data Steam's own section-jump uses (the grid's sections and position refs). While a trigger is held it steps through the groups on Steam's overlay label, then on release it scrolls to and focuses the chosen game in one jump. It also puts focus back on the last game you were on when you return to a library tab. Everything is found by shape (props, hooks, method names), never by minified names, and removed completely when the plugin unloads.
 
 ## Build
 
