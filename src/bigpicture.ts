@@ -9,7 +9,7 @@ export function injectLibraryJump(configFromInjector) {
 
         const config = {
             HOLD_DELAY_MS: 450, // hold this long before repeating starts
-            START_INTERVAL_MS: 250, // time between steps while held
+            START_INTERVAL_MS: 200, // time between steps while held
             BTN_R2: 8, BTN_L2: 7, // button ids
             WRAP_ON_TAP: true,
             WRAP_MIN_GAP_MS: 300, // a hold that stopped at the end doesn't wrap on a press this soon after its release

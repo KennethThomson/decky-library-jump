@@ -2,7 +2,7 @@ export interface Settings {
     stepMs: number; // time between jumps while holding (150-450)
     wrapOnTap: boolean;
 }
-export const DEFAULTS: Settings = { stepMs: 250, wrapOnTap: true };
+export const DEFAULTS: Settings = { stepMs: 200, wrapOnTap: true };
 const KEY = "decky-library-jump.settings";
 export const STEP_MIN = 150,
     STEP_MAX = 450,

@@ -1,7 +1,7 @@
 import { definePlugin } from "@decky/api";
 import { DialogButton, Field, Focusable, Navigation, PanelSection, PanelSectionRow, SliderField, ToggleField, staticClasses } from "@decky/ui";
 import { Fragment, useState } from "react";
-import { FaForward as PluginIcon, FaDiscord, FaGithub, FaSteam } from "react-icons/fa";
+import { FaForward as PluginIcon, FaGithub } from "react-icons/fa";
 import { Injector } from "./injector";
 import * as S from "./strings";
 import { DEFAULTS, loadSettings, saveSettings, Settings, STEP_MAX, STEP_MIN, STEP_STEP } from "./settings";
@@ -44,14 +44,6 @@ export default definePlugin(() => {
     };
     return (
       <Fragment>
-        <PanelSection title={S.ABOUT_TITLE}>
-          {/* focusable so the gamepad can land on it and the panel scrolls to it */}
-          <PanelSectionRow>
-            <Field focusable highlightOnFocus childrenLayout="below" padding="none" bottomSeparator="none">
-              <div style={{ fontSize: "12px", opacity: 0.8, whiteSpace: "normal" }}>{S.ABOUT_TEXT}</div>
-            </Field>
-          </PanelSectionRow>
-        </PanelSection>
         <PanelSection title={S.SETTINGS_TITLE}>
           <PanelSectionRow>
           <div className="decky-lj-slider">
@@ -82,8 +74,6 @@ export default definePlugin(() => {
         </PanelSection>
         <PanelSection title={S.LINKS_TITLE}>
           <LinkRow icon={<FaGithub />} label={S.LINK_GITHUB} url={S.REPO} />
-          <LinkRow icon={<FaDiscord color="#5865F2" />} label={S.LINK_DISCORD} url={S.DISCORD} />
-          <LinkRow icon={<FaSteam color="#ffffff" />} label={S.LINK_STEAM} url={S.STEAM} />
           <PanelSectionRow><div style={{ fontSize: "12px", opacity: 0.8, paddingTop: "4px", paddingBottom: "6px" }}>{S.AUTHOR}</div></PanelSectionRow>
         </PanelSection>
       </Fragment>
